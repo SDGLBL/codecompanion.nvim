@@ -135,6 +135,7 @@ function Strategy:agent()
     adapter = adapter,
     type = self.selected.type,
     messages = messages,
+    context = self.context,
   })
 end
 

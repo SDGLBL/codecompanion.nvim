@@ -1020,7 +1020,7 @@ function Chat:add_buf_message(data, opts)
 
   -- Add data to the chat buffer
   local function append_data()
-    if data.reasoning then
+    if data.reasoning and data.reasoning ~= "" then
       has_been_reasoning = true
       if new_response then
         table.insert(lines, "### Reasoning")
@@ -1028,7 +1028,7 @@ function Chat:add_buf_message(data, opts)
       end
       write(data.reasoning)
     end
-    if data.content then
+    if data.content and data.content ~= "" then
       if has_been_reasoning then
         has_been_reasoning = false
         table.insert(lines, "")
@@ -1068,6 +1068,7 @@ function Chat:add_buf_message(data, opts)
 
   -- Handle a new role
   if (data.role and data.role ~= self.last_role) or (opts and opts.force_role) then
+    vim.notify("new role")
     new_role()
   end
 

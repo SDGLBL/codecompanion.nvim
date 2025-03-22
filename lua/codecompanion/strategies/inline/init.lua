@@ -190,6 +190,7 @@ function Inline:start(opts)
       end
 
       log:info("User input received: %s", input)
+      self.context.user_input = input
       return self:classify(input)
     end)
   else
@@ -212,7 +213,7 @@ end
 function Inline:classify(user_input)
   self.classification.prompts = self:form_prompt()
 
-  if user_input then
+  if user_input and self.opts.append_user_prompt then
     table.insert(self.classification.prompts, {
       role = config.constants.USER_ROLE,
       content = "<question>" .. user_input .. "</question>",
@@ -297,29 +298,35 @@ function Inline:submit()
   local bufnr = self.classification.pos.bufnr
 
   -- Remind the LLM to respond with code only
-  table.insert(self.classification.prompts, {
-    role = config.constants.SYSTEM_ROLE,
-    content = CONSTANTS.CODE_ONLY_PROMPT,
-    opts = {
-      tag = "system_tag",
-      visible = false,
-    },
-  })
+  if self.opts.append_last_system_prompt then
+    table.insert(self.classification.prompts, {
+      role = CONSTANTS.SYSTEM_ROLE,
+      content = CONSTANTS.CODE_ONLY_PROMPT,
+      opts = {
+        tag = "system_tag",
+        visible = false,
+      },
+    })
+  end
 
   -- Add the context from the chat buffer
   if not vim.tbl_isempty(self.chat_context) then
-    local messages = adapter_utils.pluck_messages(self.chat_context, config.constants.LLM_ROLE)
-
-    if #messages > 0 then
-      table.insert(self.classification.prompts, {
-        role = config.constants.USER_ROLE,
-        content = "Here is the chat history from a conversation we had earlier. To answer my question, you _may_ need to use it:\n\n"
-          .. messages[#messages].content,
-        opts = {
-          tag = "chat_context",
-          visible = false,
-        },
-      })
+    if #self.chat_context > 0 then
+      if #self.chat_context > 0 then
+        for i = #self.chat_context, 1, -1 do
+          local message = self.chat_context[i]
+          if message.role == config.constants.LLM_ROLE or message.role == config.constants.USER_ROLE then
+            table.insert(self.classification.prompts, 2, {
+              role = message.role,
+              content = message.content,
+              opts = {
+                tag = "chat_context",
+                visible = false,
+              },
+            })
+          end
+        end
+      end
     end
   end
 
@@ -349,6 +356,8 @@ function Inline:submit()
       :set()
   end
 
+  local id = math.random(10000000)
+
   ---Callback function to be called during the stream
   ---@param err string
   ---@param data table
@@ -358,7 +367,18 @@ function Inline:submit()
     end
 
     if data then
+      local chat_data = self.adapter.handlers.chat_output(self.adapter, data)
       local content = self.adapter.handlers.inline_output(self.adapter, data, self.context)
+
+      if chat_data and chat_data.output and chat_data.output.reasoning then
+        vim.api.nvim_exec_autocmds("User", {
+          pattern = "CodeCompanionReasoningUpdated",
+          data = {
+            id = id,
+            reasoning = chat_data.output.reasoning,
+          },
+        })
+      end
 
       if content then
         vim.schedule(function()
@@ -395,6 +415,7 @@ function Inline:submit()
         formatted_name = self.adapter.formatted_name,
         model = self.adapter.schema.model.default,
       },
+      id = id,
     })
 end
 

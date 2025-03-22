@@ -92,6 +92,9 @@ return {
             if self.opts.can_reason and delta.reasoning_content then
               output.reasoning = delta.reasoning_content
             end
+            if self.opts.can_reason and delta.reasoning then
+              output.reasoning = delta.reasoning
+            end
             if delta.content then
               output.content = (output.content or "") .. delta.content
             end

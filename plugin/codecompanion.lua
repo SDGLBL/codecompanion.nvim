@@ -66,7 +66,7 @@ local has_cmp, cmp = pcall(require, "cmp")
 local has_blink, blink = pcall(require, "blink.cmp")
 if has_blink then
   pcall(function()
-    blink.add_provider("codecompanion", {
+    blink.add_source_provider("codecompanion", {
       name = "CodeCompanion",
       module = "codecompanion.providers.completion.blink",
       enabled = true,

@@ -173,7 +173,9 @@ function Client:request(payload, actions, opts)
   local job = self.opts[request](request_opts)
 
   -- Data to be sent via the request
-  opts.id = math.random(10000000)
+  if not opts.id then
+    opts.id = math.random(10000000)
+  end
   opts.adapter = {
     name = adapter.name,
     formatted_name = adapter.formatted_name,

@@ -1068,7 +1068,6 @@ function Chat:add_buf_message(data, opts)
 
   -- Handle a new role
   if (data.role and data.role ~= self.last_role) or (opts and opts.force_role) then
-    vim.notify("new role")
     new_role()
   end
 

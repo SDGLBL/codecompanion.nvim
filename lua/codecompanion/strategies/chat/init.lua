@@ -157,22 +157,6 @@ local function has_tag(tag, messages)
   )
 end
 
----Are there any user messages in the chat buffer?
----@param chat CodeCompanion.Chat
----@return boolean
-local function has_user_messages(chat)
-  local count = vim
-    .iter(chat.messages)
-    :filter(function(msg)
-      return msg.role == config.constants.USER_ROLE
-    end)
-    :totable()
-  if #count == 0 then
-    return false
-  end
-  return true
-end
-
 ---Increment the cycle count in the chat buffer
 ---@param chat CodeCompanion.Chat
 ---@return nil
@@ -876,7 +860,7 @@ function Chat:submit(opts)
   else
     local message = ts_parse_messages(self, self.header_line)
 
-    if not message and not has_user_messages(self) then
+    if not message and not helpers.has_user_messages(self) then
       return log:warn("No messages to submit")
     end
 
@@ -1177,9 +1161,9 @@ function Chat:check_context()
   -- Clear any tool's schemas
   local schemas_to_keep = {}
   local tools_in_use_to_keep = {}
-  for id, schema in pairs(self.tool_registry.schemas) do
+  for id, tool_schemas in pairs(self.tool_registry.schemas) do
     if not vim.tbl_contains(to_remove, id) then
-      schemas_to_keep[id] = schema
+      schemas_to_keep[id] = tool_schemas
       local tool_name = id:match("<tool>(.*)</tool>")
       if tool_name and self.tool_registry.in_use[tool_name] then
         tools_in_use_to_keep[tool_name] = true

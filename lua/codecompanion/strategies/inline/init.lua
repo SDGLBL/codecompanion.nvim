@@ -4,7 +4,7 @@ The Inline Assistant - This is where code is applied directly to a Neovim buffer
 
 ---@class CodeCompanion.Inline
 ---@field id number The ID of the inline prompt
----@field adapter CodeCompanion.HTTPAdapter The adapter to use for the inline prompt
+---@field adapter CodeCompanion.HTTPAdapter|CodeCompanion.ACPAdapter The adapter to use for the inline prompt
 ---@field aug number The ID for the autocmd group
 ---@field buffer_context table The context of the buffer the inline prompt was initiated from
 ---@field bufnr number The buffer number to apply the inline edits to
@@ -15,9 +15,10 @@ The Inline Assistant - This is where code is applied directly to a Neovim buffer
 ---@field lines table Lines in the buffer before the inline changes
 ---@field opts table
 ---@field prompts table The prompts to send to the LLM
+---@field _streaming_before_classify? boolean Adapter streaming state captured before classification
 
 ---@class CodeCompanion.InlineArgs
----@field adapter? CodeCompanion.HTTPAdapter
+---@field adapter? CodeCompanion.HTTPAdapter|CodeCompanion.ACPAdapter|string|function
 ---@field buffer_context? table The context of the buffer the inline prompt was initiated from
 ---@field chat_context? table Messages from a chat buffer
 ---@field diff? table The diff provider
@@ -30,6 +31,7 @@ The Inline Assistant - This is where code is applied directly to a Neovim buffer
 ---@class CodeCompanion.Inline.Classification
 ---@field placement string The placement of the code in Neovim
 ---@field pos {line: number, col: number, bufnr: number} The data for where the prompt should be placed
+---@field prompts? table The prompts used during classification
 
 local adapters = require("codecompanion.adapters")
 local buffer_utils = require("codecompanion.utils.buffers")
@@ -128,6 +130,15 @@ local function overwrite_selection(context)
   api.nvim_win_set_cursor(context.winnr, { context.start_line, context.start_col })
 end
 
+---@param adapter CodeCompanion.HTTPAdapter|CodeCompanion.ACPAdapter
+---@param data table|string
+---@param tools? table
+---@return {status: string, output: table}|nil
+local function parse_chat_output(adapter, data, tools)
+  tools = tools or {}
+  return adapters.call_handler(adapter --[[@as CodeCompanion.HTTPAdapter]], "parse_chat", data, tools)
+end
+
 ---@class CodeCompanion.Inline
 local Inline = {}
 
@@ -174,12 +185,33 @@ function Inline.new(args)
 end
 
 ---Set the adapter for the inline prompt
----@param adapter CodeCompanion.HTTPAdapter|string|function
+---@param adapter CodeCompanion.HTTPAdapter|CodeCompanion.ACPAdapter|string|function
 ---@return nil
 function Inline:set_adapter(adapter)
-  if not self.adapter or not adapters.resolved(adapter) then
-    self.adapter = adapters.resolve(adapter)
+  if not adapter then
+    return
   end
+
+  local target = adapter
+  if type(target) == "function" then
+    target = target()
+  end
+
+  if not target then
+    return
+  end
+
+  if not adapters.resolved(target) then
+    target = adapters.resolve(target)
+  end
+
+  if not target then
+    return
+  end
+
+  self.adapter = target
+  self.adapter.opts = self.adapter.opts or {}
+  self._streaming_before_classify = self.adapter.opts and self.adapter.opts.stream or nil
 end
 
 ---Start the classification of the user's prompt
@@ -251,6 +283,7 @@ function Inline:classify(user_input)
     utils.fire("InlineStarted")
 
     -- Classification step uses streaming
+    self._streaming_before_classify = self.adapter.opts and self.adapter.opts.stream or nil
     self.adapter.opts.stream = true
     self.classification.placement = ""
 
@@ -263,8 +296,12 @@ function Inline:classify(user_input)
       end
 
       if data then
-        local content = self.adapter.handlers.chat_output(self.adapter, data)
-        self.classification.placement = self.classification.placement .. content.output.content
+        local chat_data = parse_chat_output(self.adapter, data)
+        local text = chat_data and chat_data.output and chat_data.output.content
+        if type(text) == "string" and text ~= "" then
+          local placement = self.classification.placement or ""
+          self.classification.placement = placement .. text
+        end
       end
     end
 
@@ -379,12 +416,12 @@ function Inline:prompt(user_prompt)
         log:info("[Inline] User input received: %s", input)
         add_prompt("<prompt>" .. input .. "</prompt>", user_role)
         self.prompts = prompts
-        return self:submit(vim.deepcopy(prompts))
+        return self:submit()
       end)
     end)
   else
     self.prompts = prompts
-    return self:submit(vim.deepcopy(prompts))
+    return self:submit()
   end
 end
 
@@ -600,7 +637,7 @@ function Inline:submit()
 
     if data then
       log:trace("[Inline] Processing data: %s", data)
-      local chat_data = self.adapter.handlers.chat_output(self.adapter, data)
+      local chat_data = parse_chat_output(self.adapter, data)
 
       if chat_data and chat_data.output and chat_data.output.reasoning then
         utils.fire("ReasoningUpdated", {
@@ -609,10 +646,11 @@ function Inline:submit()
         })
       end
 
-      if chat_data and chat_data.output.content then
+      local text = chat_data and chat_data.output and chat_data.output.content
+      if type(text) == "string" and text ~= "" then
         vim.schedule(function()
           vim.cmd.undojoin()
-          self:add_buf_message(chat_data.output.content)
+          self:add_buf_message(text)
           if self.classification.placement == "new" and api.nvim_get_current_buf() == bufnr then
             self:buf_scroll_to_end(bufnr)
           end
@@ -797,7 +835,7 @@ end
 ---A user's inline prompt may need to be converted into a chat
 ---@return CodeCompanion.Chat
 function Inline:send_to_chat()
-  local prompt = self.classification.prompts
+  local prompt = vim.deepcopy(self.classification.prompts or {})
 
   for i = #prompt, 1, -1 do
     -- Remove all of the system prompts
@@ -812,18 +850,25 @@ function Inline:send_to_chat()
 
   api.nvim_clear_autocmds({ group = self.aug })
 
+  if self._streaming_before_classify ~= nil then
+    self.adapter.opts.stream = self._streaming_before_classify
+    self._streaming_before_classify = nil
+  end
+
   return require("codecompanion.strategies.chat").new({
     buffer_context = self.buffer_context,
     adapter = self.adapter,
     messages = prompt,
     auto_submit = true,
+    callbacks = {},
+    last_role = config.constants.USER_ROLE,
   })
 end
 
 ---Send a prompt to the chat if the placement is chat
 ---@return CodeCompanion.Chat
 function Inline:to_chat()
-  local prompt = self.prompts
+  local prompt = vim.deepcopy(self.prompts or {})
   log:info("[Inline] Sending to chat")
 
   for i = #prompt, 1, -1 do
@@ -838,13 +883,18 @@ function Inline:to_chat()
   end
 
   -- Turn streaming back on
-  self.adapter.opts.stream = _streaming
+  if self._streaming_before_classify ~= nil then
+    self.adapter.opts.stream = self._streaming_before_classify
+    self._streaming_before_classify = nil
+  end
 
   return require("codecompanion.strategies.chat").new({
     adapter = self.adapter,
     auto_submit = true,
     buffer_context = self.buffer_context,
     messages = prompt,
+    callbacks = {},
+    last_role = config.constants.USER_ROLE,
   })
 end
 

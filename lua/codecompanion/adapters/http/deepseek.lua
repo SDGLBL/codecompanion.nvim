@@ -106,11 +106,12 @@ return {
 
           if delta then
             output.role = delta.role
-            output.content = delta.content
 
             if delta.reasoning_content then
               output.reasoning = output.reasoning or {}
               output.reasoning.content = delta.reasoning_content
+            else
+              output.content = delta.content
             end
 
             -- Process tools

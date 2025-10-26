@@ -639,7 +639,7 @@ function Inline:submit()
       log:trace("[Inline] Processing data: %s", data)
       local chat_data = parse_chat_output(self.adapter, data)
 
-      if chat_data and chat_data.output and chat_data.output.reasoning then
+      if chat_data and chat_data.output and chat_data.output.reasoning and chat_data.output.reasoning.content then
         utils.fire("ReasoningUpdated", {
           id = id,
           reasoning = chat_data.output.reasoning.content,

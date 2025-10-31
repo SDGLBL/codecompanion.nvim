@@ -16,6 +16,7 @@ The Inline Assistant - This is where code is applied directly to a Neovim buffer
 ---@field opts table
 ---@field prompts table The prompts to send to the LLM
 ---@field _streaming_before_classify? boolean Adapter streaming state captured before classification
+---@field _original_content? string[] Buffer content captured prior to streaming edits
 
 ---@class CodeCompanion.InlineArgs
 ---@field adapter? CodeCompanion.HTTPAdapter|CodeCompanion.ACPAdapter|string|function
@@ -34,7 +35,6 @@ The Inline Assistant - This is where code is applied directly to a Neovim buffer
 ---@field prompts? table The prompts used during classification
 
 local adapters = require("codecompanion.adapters")
-local buffer_utils = require("codecompanion.utils.buffers")
 local client = require("codecompanion.http")
 local config = require("codecompanion.config")
 local keymaps = require("codecompanion.utils.keymaps")
@@ -164,6 +164,7 @@ function Inline.new(args)
     lines = {},
     opts = args.opts or {},
     prompts = vim.deepcopy(args.prompts),
+    _original_content = nil,
   }, { __index = Inline })
 
   self:set_adapter(args.adapter or config.strategies.inline.adapter)
@@ -212,6 +213,35 @@ function Inline:set_adapter(adapter)
   self.adapter = target
   self.adapter.opts = self.adapter.opts or {}
   self._streaming_before_classify = self.adapter.opts and self.adapter.opts.stream or nil
+end
+
+---Parse special syntax from user prompt (adapters and maintain variables)
+---@param prompt string
+---@return string
+function Inline:parse_special_syntax(prompt)
+  local adapter_pattern = "<([%w_]+)>"
+  local adapter_match = prompt:match(adapter_pattern)
+  local config_adapters =
+    vim.tbl_deep_extend("force", {}, config.adapters.acp or {}, config.adapters.http or {}, config.adapters or {})
+
+  if adapter_match then
+    if config_adapters[adapter_match] then
+      self:set_adapter(adapter_match)
+      prompt = prompt:gsub(adapter_pattern, "", 1)
+    else
+      utils.notify("Adapter not found: " .. adapter_match, vim.log.levels.ERROR)
+    end
+  else
+    local split = vim.split(prompt, " ")
+    local first_word = split[1]
+    if config_adapters[first_word] then
+      self:set_adapter(first_word)
+      table.remove(split, 1)
+      prompt = table.concat(split, " ")
+    end
+  end
+
+  return vim.trim(prompt)
 end
 
 ---Start the classification of the user's prompt
@@ -380,14 +410,7 @@ function Inline:prompt(user_prompt)
   end
 
   if user_prompt then
-    -- 1. Check if the first word is an adapter
-    local split = vim.split(user_prompt, " ")
-    if config.adapters and config.adapters[split[1]] then
-      local adapter = config.adapters[split[1]]
-      self:set_adapter(adapter)
-      table.remove(split, 1)
-      user_prompt = table.concat(split, " ")
-    end
+    user_prompt = self:parse_special_syntax(user_prompt)
 
     -- Check for any variables
     local vars = variables.new({ inline = self, prompt = user_prompt })
@@ -537,9 +560,32 @@ function Inline:stop()
 end
 
 ---Submit the prompts to the LLM to process
+---@param prompt? table
 ---@return nil
-function Inline:submit()
-  self:place(self.classification.placement)
+function Inline:submit(prompt)
+  if prompt then
+    self.prompts = prompt
+  end
+
+  local placement = self.classification.placement
+  if not placement or placement == "" then
+    log:error("[Inline] No placement determined before submission")
+    return
+  end
+
+  if placement ~= "new" then
+    local ok, content = pcall(api.nvim_buf_get_lines, self.buffer_context.bufnr, 0, -1, true)
+    if ok then
+      self._original_content = content
+    else
+      log:error("[Inline] Unable to capture original buffer content for diff: %s", content)
+      self._original_content = nil
+    end
+  else
+    self._original_content = nil
+  end
+
+  self:place(placement)
   log:debug("[Inline] Determined position for output: %s", self.classification.pos)
 
   local bufnr = self.classification.pos.bufnr
@@ -598,9 +644,6 @@ function Inline:submit()
   })
 
   if vim.tbl_contains({ "replace", "add", "before" }, self.classification.placement) then
-    pcall(function()
-      self:start_diff(vim.split(buffer_utils.get_content(bufnr), "\n"))
-    end)
     if config.strategies and config.strategies.inline and config.strategies.inline.keymaps then
       keymaps
         .new({
@@ -669,7 +712,17 @@ function Inline:submit()
     api.nvim_clear_autocmds({ group = self.aug })
 
     vim.schedule(function()
-      utils.fire("InlineFinished", { placement = self.classification.placement })
+      local placement = self.classification.placement
+      local show_diff = config.display.diff.enabled and placement ~= "new" and self._original_content
+
+      if show_diff then
+        self:start_diff(self._original_content)
+      else
+        self:reset()
+      end
+
+      self._original_content = nil
+      utils.fire("InlineFinished", { placement = placement })
     end)
   end
 

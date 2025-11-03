@@ -160,7 +160,7 @@ function Inline.new(args)
       pos = {},
     },
     chat_context = args.chat_context or {},
-    diff = args.diff or {},
+    diff = args.diff,
     lines = {},
     opts = args.opts or {},
     prompts = vim.deepcopy(args.prompts),
@@ -588,6 +588,10 @@ function Inline:submit(prompt)
   self:place(placement)
   log:debug("[Inline] Determined position for output: %s", self.classification.pos)
 
+  if config.display.diff.enabled and placement ~= "new" and self._original_content then
+    self:start_diff(self._original_content)
+  end
+
   local bufnr = self.classification.pos.bufnr
 
   -- Create fresh prompts for code generation (not reusing classification prompts)
@@ -713,12 +717,17 @@ function Inline:submit(prompt)
 
     vim.schedule(function()
       local placement = self.classification.placement
+      local diff_active = self.diff ~= nil
       local show_diff = config.display.diff.enabled and placement ~= "new" and self._original_content
 
-      if show_diff then
-        self:start_diff(self._original_content)
+      if not diff_active then
+        if show_diff then
+          self:start_diff(self._original_content)
+        else
+          self:reset()
+        end
       else
-        self:reset()
+        self:refresh_diff({ status = "final" })
       end
 
       self._original_content = nil
@@ -781,6 +790,7 @@ function Inline:add_buf_message(content)
 
   self.classification.pos.line = line + 1
   self.classification.pos.col = col
+  self:refresh_diff({ status = "streaming" })
 end
 
 ---Scroll buffer to end
@@ -799,6 +809,24 @@ end
 function Inline:reset()
   self.current_request = nil
   api.nvim_clear_autocmds({ group = self.aug })
+end
+
+---Refresh the active diff provider if it supports streaming updates
+---@param opts? table
+function Inline:refresh_diff(opts)
+  if not self.diff or type(self.diff) ~= "table" then
+    return
+  end
+
+  local refresh = self.diff.refresh
+  if type(refresh) ~= "function" then
+    return
+  end
+
+  local ok, err = pcall(refresh, self.diff, opts or {})
+  if not ok then
+    log:error("[Inline] Failed to refresh diff: %s", err)
+  end
 end
 
 ---With the placement determined, we can now place the output from the inline prompt

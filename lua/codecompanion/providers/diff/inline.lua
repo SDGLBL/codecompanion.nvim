@@ -172,6 +172,44 @@ function InlineDiff:clear_highlights()
     api.nvim_buf_clear_namespace(self.bufnr, self.ns_id, 0, -1)
   end
   self.extmark_ids = {}
+  self.has_changes = false
+end
+
+---Recalculate diff highlights using the current buffer content
+---@param opts? table|nil
+function InlineDiff:refresh(opts)
+  opts = opts or {}
+
+  if not api.nvim_buf_is_valid(self.bufnr) then
+    return
+  end
+
+  local current_content = api.nvim_buf_get_lines(self.bufnr, 0, -1, false)
+  if self:are_contents_equal(self.contents, current_content) then
+    if self.has_changes then
+      self:clear_highlights()
+    end
+    return
+  end
+
+  self:clear_highlights()
+  self.has_changes = true
+
+  local first_diff_line = self:apply_diff_highlights(self.contents, current_content)
+
+  local should_reposition = opts.reposition
+  if should_reposition == nil and opts.status == "final" then
+    should_reposition = true
+  end
+
+  if should_reposition and first_diff_line then
+    vim.schedule(function()
+      self.winnr = self.winnr and self.winnr or vim.fn.bufwinid(self.bufnr)
+      if self.winnr ~= -1 then
+        pcall(api.nvim_win_set_cursor, self.winnr, { first_diff_line, 0 })
+      end
+    end)
+  end
 end
 
 ---Accepts the diff changes and clears highlights

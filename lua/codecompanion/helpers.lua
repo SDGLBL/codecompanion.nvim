@@ -23,7 +23,7 @@ function M.get_prompt_aliases()
 end
 
 ---Create and show a diff in a floating window
----@param args { from_lines: string[], to_lines: string[], ft: string, banner?: string, skip_default_keymaps?: boolean, chat_bufnr?: number, inline?: boolean, tool_name?: string, title?: string, diff_id: number, marker_add?: string, marker_delete?: string, bufnr?: number, keymaps?: { on_accept?: fun(diff_ui: CodeCompanion.DiffUI), on_always_accept?: fun(diff_ui: CodeCompanion.DiffUI), on_reject?: fun(diff_ui: CodeCompanion.DiffUI) } }
+---@param args { from_lines: string[], to_lines: string[], ft: string, banner?: string, skip_default_keymaps?: boolean, chat_bufnr?: number, inline?: boolean, live?: boolean, tool_name?: string, title?: string, diff_id: number, marker_add?: string, marker_delete?: string, bufnr?: number, keymaps?: { on_accept?: fun(diff_ui: CodeCompanion.DiffUI), on_always_accept?: fun(diff_ui: CodeCompanion.DiffUI), on_reject?: fun(diff_ui: CodeCompanion.DiffUI) } }
 ---@return CodeCompanion.DiffUI
 function M.show_diff(args)
   local bufnr = args.bufnr
@@ -56,6 +56,7 @@ function M.show_diff(args)
     diff_id = args.diff_id,
     inline = args.inline or false,
     keymaps = args.keymaps,
+    live = args.live,
     skip_default_keymaps = args.skip_default_keymaps,
     title = args.title,
     tool_name = args.tool_name,

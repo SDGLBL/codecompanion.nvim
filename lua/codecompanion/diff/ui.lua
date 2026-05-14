@@ -20,6 +20,7 @@ local M = {}
 ---@field hunks number The total number of hunks in the diff
 ---@field inline? boolean Whether the diff is shown inline or in a floating window
 ---@field keymaps table<string, fun(diff_ui: CodeCompanion.DiffUI)> Custom keymap callbacks (on_accept, on_reject, on_always_accept)
+---@field live? boolean Whether inline diff redraws against live buffer contents
 ---@field ns number The namespace ID for diff extmarks
 ---@field resolved boolean Whether the diff has been resolved (accepted/rejected)
 ---@field tool_name? string This is essential for approvals to work with tools
@@ -65,6 +66,23 @@ end
 ---@return string
 local function build_banner_text(opts)
   return fmt(" [Hunk: %d/%d]  %s ", opts.current_hunk or 1, opts.hunks or 1, opts.banner or get_default_banner())
+end
+
+---@param first string[]
+---@param second string[]
+---@return boolean
+local function lines_equal(first, second)
+  if #first ~= #second then
+    return false
+  end
+
+  for index, line in ipairs(first) do
+    if second[index] ~= line then
+      return false
+    end
+  end
+
+  return true
 end
 
 ---Show banner in the diff buffer
@@ -262,19 +280,17 @@ function DiffUI:apply_extmarks(diff, bufnr)
   end
 end
 
----Clear diff extmarks from buffer
+---Clear diff extmarks from buffer without removing autocommands
+---@param opts? { preserve_buffer?: boolean }
 ---@return nil
-function DiffUI:clear()
-  if self.aug_group then
-    pcall(api.nvim_del_augroup_by_id, self.aug_group)
-  end
-
+function DiffUI:clear_marks(opts)
+  opts = opts or {}
   if self.banner_ns then
     pcall(api.nvim_buf_clear_namespace, self.bufnr, self.banner_ns, 0, -1)
   end
 
   if self.inline then
-    if self.inline_spacer_mark then
+    if self.inline_spacer_mark and not opts.preserve_buffer then
       local pos = api.nvim_buf_get_extmark_by_id(self.bufnr, self.ns, self.inline_spacer_mark, {})
       if pos and pos[1] then
         pcall(api.nvim_buf_set_lines, self.bufnr, pos[1], pos[1] + 1, false, {})
@@ -282,6 +298,103 @@ function DiffUI:clear()
       self.inline_spacer_mark = nil
     end
     return pcall(api.nvim_buf_clear_namespace, self.bufnr, self.ns, 0, -1)
+  end
+end
+
+---Clear diff extmarks from buffer
+---@param opts? { preserve_buffer?: boolean }
+---@return nil
+function DiffUI:clear(opts)
+  if self.aug_group then
+    pcall(api.nvim_del_augroup_by_id, self.aug_group)
+  end
+
+  return self:clear_marks(opts)
+end
+
+---Apply live inline diff highlights without mutating buffer text
+---@param diff CC.Diff
+---@param bufnr number
+---@return nil
+function DiffUI:apply_live_inline(diff, bufnr)
+  local line_count = api.nvim_buf_line_count(bufnr)
+  local marker_add = diff.marker_add
+  local marker_delete = diff.marker_delete
+
+  for _, hunk in ipairs(diff.hunks) do
+    local anchor_row = math.min(math.max((hunk.to_start or 1) - 1, 0), math.max(line_count - 1, 0))
+    hunk.pos = { anchor_row, 0 }
+
+    if hunk.to_count > 0 then
+      for index = 0, hunk.to_count - 1 do
+        local row = hunk.to_start - 1 + index
+        if row >= 0 and row < line_count then
+          pcall(api.nvim_buf_set_extmark, bufnr, self.ns, row, 0, {
+            line_hl_group = "CodeCompanionDiffAdd",
+            virt_text = marker_add and { { marker_add .. " ", "CodeCompanionDiffAdd" } } or nil,
+            virt_text_pos = marker_add and "inline" or nil,
+            hl_mode = marker_add and "combine" or nil,
+            priority = 150,
+          })
+        end
+      end
+    end
+
+    if hunk.from_count > 0 then
+      local deleted_lines = vim.list_slice(diff.from.lines, hunk.from_start, hunk.from_start + hunk.from_count - 1)
+      local virt_lines = diff_utils.create_vl(table.concat(deleted_lines, "\n"), {
+        ft = diff.ft or vim.bo[bufnr].filetype,
+        bg = "CodeCompanionDiffDelete",
+      })
+      if marker_delete then
+        virt_lines = diff_utils.prepend_marker(virt_lines, marker_delete, "CodeCompanionDiffDelete")
+      end
+      virt_lines = diff_utils.extend_vl(virt_lines, "CodeCompanionDiffDelete")
+      pcall(api.nvim_buf_set_extmark, bufnr, self.ns, anchor_row, 0, {
+        virt_lines = virt_lines,
+        virt_lines_above = hunk.to_count > 0,
+        hl_mode = "combine",
+        priority = 150,
+      })
+    end
+  end
+end
+
+---Refresh a live inline diff against the current buffer contents
+---@param opts? { status?: string }
+---@return nil
+function DiffUI:refresh(opts)
+  opts = opts or {}
+  if not self.live or not api.nvim_buf_is_valid(self.bufnr) then
+    return
+  end
+
+  local current_content = api.nvim_buf_get_lines(self.bufnr, 0, -1, false)
+  if self.diff and lines_equal(self.diff.to.lines, current_content) then
+    return
+  end
+
+  local diff = require("codecompanion.diff").create({
+    bufnr = self.bufnr,
+    ft = self.diff.ft,
+    from_lines = self.diff.from.lines,
+    to_lines = current_content,
+    marker_add = self.diff.marker_add,
+    marker_delete = self.diff.marker_delete,
+    inline = true,
+  })
+
+  self:clear_marks({ preserve_buffer = true })
+  self.diff = diff
+  self.hunks = #diff.hunks
+  self.current_hunk = self.hunks > 0 and math.min(self.current_hunk, self.hunks) or 1
+  self:apply_live_inline(diff, self.bufnr)
+  utils.fire("DiffHunkChanged", { id = self.diff_id, bufnr = self.bufnr })
+
+  if opts.status == "final" and diff.hunks[1] then
+    vim.schedule(function()
+      ui_utils.scroll_to_line(self.bufnr, diff.hunks[1].pos[1] + 1)
+    end)
   end
 end
 
@@ -549,6 +662,7 @@ end
 ---@field keymaps.on_always_accept? fun(diff_ui: CodeCompanion.DiffUI)
 ---@field keymaps.on_accept? fun(diff_ui: CodeCompanion.DiffUI)
 ---@field keymaps.on_reject? fun(diff_ui: CodeCompanion.DiffUI)
+---@field live? boolean
 ---@field skip_default_keymaps? boolean
 ---@field title? string
 ---@field tool_name? string
@@ -585,13 +699,16 @@ function M.show(diff, opts)
     hunks = #diff.hunks,
     inline = opts.inline or not is_float,
     keymaps = opts.keymaps or {},
+    live = opts.live == true,
     ns = api.nvim_create_namespace("codecompanion_diff_extmarks_" .. tostring(diff_id)),
     resolved = false,
     tool_name = opts.tool_name,
     winnr = winnr,
   }, DiffUI)
 
-  if is_inline then
+  if is_inline and diff_ui.live then
+    diff_ui:apply_live_inline(diff, bufnr)
+  elseif is_inline then
     diff_ui:apply_inline(diff, bufnr)
   else
     diff_ui:apply_extmarks(diff, bufnr)

@@ -108,6 +108,11 @@ end
 
 T["Inline"]["forms correct prompts"] = function()
   child.lua([[
+    _G.dispatched_prompts = {}
+    function inline:dispatch_prompts(prompts)
+      _G.dispatched_prompts = prompts
+    end
+
     local prompts = {
       {
         role = "user",
@@ -123,14 +128,12 @@ T["Inline"]["forms correct prompts"] = function()
     inline:prompt("Hello World")
   ]])
 
-  local prompts = child.lua([[return inline.prompts]])
-  h.eq(#prompts, 4)
-  -- System prompt
-  h.expect_starts_with("You are a knowledgeable", prompts[1].content)
+  local prompts = child.lua([[return _G.dispatched_prompts]])
+  h.eq(#prompts, 3)
   -- Visual selection
   h.eq(
     "For context, this is the code that I've visually selected in the buffer, which is relevant to my prompt:\n<code>\n```lua\nlocal x = 1\n```\n</code>",
-    prompts[3].content
+    prompts[2].content
   )
   -- User prompt
   h.eq("<prompt>Hello World</prompt>", prompts[#prompts].content)
@@ -138,9 +141,8 @@ end
 
 T["Inline"]["generates correct prompt structure"] = function()
   child.lua([[
-    -- Mock the submit function
     _G.submitted_prompts = {}
-    function inline:submit(prompts)
+    function inline:dispatch_prompts(prompts)
       _G.submitted_prompts = prompts
     end
 
@@ -148,17 +150,15 @@ T["Inline"]["generates correct prompt structure"] = function()
   ]])
 
   local submitted_prompts = child.lua([[return _G.submitted_prompts]])
-  h.eq(#submitted_prompts, 2) -- Should be a system prompt and the user prompt
-  h.eq(submitted_prompts[1].role, "system")
-  h.eq(submitted_prompts[2].role, "user")
-  h.eq(submitted_prompts[2].content, "<prompt>Test prompt</prompt>")
+  h.eq(#submitted_prompts, 1)
+  h.eq(submitted_prompts[1].role, "user")
+  h.eq(submitted_prompts[1].content, "<prompt>Test prompt</prompt>")
 end
 
 T["Inline"]["the first word can be an adapter"] = function()
   child.lua([[
-    -- Mock the submit function
     _G.submitted_prompts = {}
-    function inline:submit(prompts)
+    function inline:dispatch_prompts(prompts)
       _G.submitted_prompts = prompts
     end
   ]])
@@ -173,11 +173,16 @@ T["Inline"]["the first word can be an adapter"] = function()
 
   -- Adapter is removed from the prompt
   local submitted_prompts = child.lua([[return _G.submitted_prompts]])
-  h.eq(submitted_prompts[2].content, "<prompt>print hello world</prompt>")
+  h.eq(submitted_prompts[1].content, "<prompt>print hello world</prompt>")
 end
 
 T["Inline"]["can be called from the action palette"] = function()
   child.lua([[
+    local Inline = require("codecompanion.interactions.inline")
+    function Inline:classify(prompts)
+      self.prompts = prompts
+    end
+
     local prompt = {
       name = "test",
       strategy = "inline",
@@ -198,18 +203,16 @@ T["Inline"]["can be called from the action palette"] = function()
     _G.test_interaction = interaction
   ]])
 
-  -- System prompt is added
-  h.eq(2, child.lua([[return #_G.test_interaction.called.prompts]]))
+  h.eq(1, child.lua([[return #_G.test_interaction.called.prompts]]))
 
   -- User prompt is added
-  h.eq("Action Palette test", child.lua([[return _G.test_interaction.called.prompts[2].content]]))
+  h.eq("Action Palette test", child.lua([[return _G.test_interaction.called.prompts[1].content]]))
 end
 
 T["Inline"]["integration"] = function()
   child.lua([[
-    -- Mock the submit function
     _G.submitted_prompts = {}
-    function inline:submit(prompts)
+    function inline:dispatch_prompts(prompts)
       _G.submitted_prompts = prompts
     end
 
@@ -217,14 +220,14 @@ T["Inline"]["integration"] = function()
   ]])
 
   local submitted_prompts = child.lua([[return _G.submitted_prompts]])
-  h.eq("The output from foo editor context", submitted_prompts[2].content)
-  h.eq("<prompt>can you print hello world?</prompt>", submitted_prompts[3].content)
+  h.eq("The output from foo editor context", submitted_prompts[1].content)
+  h.eq("<prompt>can you print hello world?</prompt>", submitted_prompts[2].content)
 end
 
 T["Inline"]["can parse adapter syntax"] = function()
   child.lua([[
     _G.submitted_prompts = {}
-    function inline:submit(prompts)
+    function inline:dispatch_prompts(prompts)
       _G.submitted_prompts = prompts
     end
 
@@ -244,11 +247,11 @@ T["Inline"]["can parse adapter syntax"] = function()
   child.lua([[inline:prompt("adapter=fake_adapter #{buffer} print hello world")]])
   h.eq("fake_adapter", child.lua([[return inline.adapter.name]]))
 
-  -- Should be system + buffer content + user prompt
+  -- Should be buffer content + user prompt
   local submitted_prompts = child.lua([[return _G.submitted_prompts]])
-  h.eq(3, #submitted_prompts)
+  h.eq(2, #submitted_prompts)
 
-  h.eq("mocked buffer content", submitted_prompts[2].content)
+  h.eq("mocked buffer content", submitted_prompts[1].content)
 
   -- Check We've cleaned up the prompt
   h.eq("<prompt>print hello world</prompt>", submitted_prompts[#submitted_prompts].content)
@@ -257,6 +260,34 @@ T["Inline"]["can parse adapter syntax"] = function()
   child.lua([[
     require("codecompanion.config").interactions.inline.editor_context.buffer = _G.original_buffer_variable
   ]])
+end
+
+T["Inline"]["streams text into buffer and refreshes live diff"] = function()
+  child.lua([[
+    local config = require("codecompanion.config")
+    config.display.diff.enabled = true
+
+    local bufnr = vim.api.nvim_get_current_buf()
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "local x = 1" })
+    inline.buffer_context.bufnr = bufnr
+    inline.buffer_context.winnr = vim.api.nvim_get_current_win()
+    inline.buffer_context.start_line = 1
+    inline.buffer_context.end_line = 1
+    inline.buffer_context.start_col = 0
+    inline.buffer_context.end_col = 0
+    inline.classification.placement = "add"
+
+    inline:capture_original_content("add")
+    inline:place("add")
+    inline:start_live_diff("add")
+    inline:add_buf_message("print('hi')\n")
+  ]])
+
+  local lines = child.lua([[return vim.api.nvim_buf_get_lines(0, 0, -1, false)]])
+  h.eq("local x = 1", lines[1])
+  h.eq("print('hi')", lines[2])
+  h.eq(true, child.lua([[return inline.diff_ui ~= nil and inline.diff_ui.live == true]]))
+  h.eq(true, child.lua([[return inline.diff_ui.hunks > 0]]))
 end
 
 return T

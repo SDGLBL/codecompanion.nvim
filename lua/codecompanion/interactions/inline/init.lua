@@ -16,6 +16,7 @@ The Inline Interaction - This is where code is applied directly to a Neovim buff
 ---@field opts table
 ---@field original_content? string[] The original buffer content before LLM changes
 ---@field prompts table The prompts to send to the LLM
+---@field streaming_before_request? boolean The adapter streaming state before inline changes it
 
 ---@class CodeCompanion.InlineArgs
 ---@field adapter? CodeCompanion.HTTPAdapter
@@ -128,6 +129,41 @@ If placement is "chat", omit the "code" and "language" fields:
 {
   "placement": "chat"
 }]],
+
+  PLACEMENT_PROMPT = [[I would like you to assess a prompt which has been made from within the Neovim text editor. Based on this prompt, determine where the output from this prompt should be placed. I am calling this determination the "<method>".
+
+The available methods are:
+
+1. `replace` the current selection
+2. `add` after the current cursor position
+3. `before` before the current cursor position
+4. `new` in a new buffer/file
+5. `chat` in a chat buffer which the user can then interact with
+
+Examples:
+
+- "Can you refactor/fix/amend this code?" should be `replace`
+- "Can you create a method/function that does XYZ" should be `add`
+- "Can you add a docstring to this function?" should be `before`
+- "Can you create a method/function for XYZ and put it in a new buffer?" should be `new`
+- "Can you write unit tests for this code?" should be `new`
+- "Why is Neovim so popular?" or "What does this code do?" should be `chat`
+- "Write some comments for this code." should be `replace`
+
+Respond with only one tag: `<replace>`, `<add>`, `<before>`, `<new>`, `<chat>`, or `<error>`.]],
+
+  CODE_ONLY_PROMPT = [[The following response must contain ONLY raw text that can be directly written to a Neovim buffer:
+
+1. No Markdown formatting or backticks
+2. No explanations or prose
+3. Use proper indentation and spacing for the target buffer
+4. Include comments only when the user asked for code that needs them
+5. Use actual line breaks
+6. Preserve all whitespace
+7. Only include the requested content
+8. Do not echo the full file unless the prompt requires it
+
+If you cannot provide clean buffer-ready text, reply with `<error>`]],
 }
 
 ---Format code into a code block alongside a message
@@ -175,6 +211,30 @@ local function overwrite_selection(context)
   api.nvim_win_set_cursor(context.winnr, { context.start_line, context.start_col })
 end
 
+---@param adapter CodeCompanion.HTTPAdapter
+---@param data table|string
+---@param tools? table
+---@return {status: string, output: table}|nil
+local function parse_chat_output(adapter, data, tools)
+  local result = adapters.call_handler(adapter, "parse_chat", data, tools or {})
+  local parse_meta = adapters.get_handler(adapter, "parse_meta")
+
+  if result and result.extra and type(parse_meta) == "function" then
+    result = parse_meta(adapter, result)
+  end
+
+  return result
+end
+
+---@param bufnr number
+---@return string[]
+local function get_buffer_lines(bufnr)
+  if not api.nvim_buf_is_valid(bufnr) then
+    return {}
+  end
+  return api.nvim_buf_get_lines(bufnr, 0, -1, true)
+end
+
 ---@class CodeCompanion.Inline
 local Inline = {}
 
@@ -198,7 +258,9 @@ function Inline.new(args)
     chat_context = args.chat_context or {},
     lines = {},
     opts = args.opts or {},
+    original_content = nil,
     prompts = vim.deepcopy(args.prompts),
+    streaming_before_request = nil,
   }, { __index = Inline })
 
   self:set_adapter(args.adapter or config.interactions.inline.adapter)
@@ -227,6 +289,26 @@ end
 function Inline:set_adapter(adapter)
   if not self.adapter or not adapters.resolved(adapter) then
     self.adapter = adapters.resolve(adapter)
+  end
+  if self.adapter then
+    self.adapter.opts = self.adapter.opts or {}
+  end
+end
+
+---Remember the adapter streaming state before inline temporarily changes it
+---@return nil
+function Inline:capture_streaming_state()
+  if self.streaming_before_request == nil and self.adapter and self.adapter.opts then
+    self.streaming_before_request = self.adapter.opts.stream
+  end
+end
+
+---Restore the adapter streaming state after inline has finished
+---@return nil
+function Inline:restore_streaming_state()
+  if self.streaming_before_request ~= nil and self.adapter and self.adapter.opts then
+    self.adapter.opts.stream = self.streaming_before_request
+    self.streaming_before_request = nil
   end
 end
 
@@ -274,6 +356,94 @@ function Inline:set_keymaps(bufnr, opts)
     :set(opts)
 end
 
+---Submit immediately when placement is known, otherwise classify first
+---@param prompts table
+---@return nil
+function Inline:dispatch_prompts(prompts)
+  self.prompts = prompts
+
+  if self.classification.placement then
+    return self:submit(prompts)
+  end
+
+  return self:classify(prompts)
+end
+
+---Build the payload used to classify where inline output should go
+---@param prompts table
+---@return table
+function Inline:build_classification_payload(prompts)
+  local user_prompts = vim
+    .iter(prompts)
+    :filter(function(prompt)
+      return prompt.role == config.constants.USER_ROLE
+    end)
+    :map(function(prompt)
+      return prompt.content
+    end)
+    :totable()
+
+  return {
+    messages = self.adapter:map_roles({
+      { role = config.constants.SYSTEM_ROLE, content = CONSTANTS.PLACEMENT_PROMPT },
+      { role = config.constants.USER_ROLE, content = table.concat(user_prompts, "\n") },
+    }),
+    tools = {},
+  }
+end
+
+---Handle the completed placement classification
+---@param placement string
+---@param prompts table
+---@return nil
+function Inline:finish_classification(placement, prompts)
+  local parsed = placement:match("<(.-)>")
+  if not parsed or parsed == "error" then
+    return log:error("[Inline] Could not determine where to place the output from the prompt")
+  end
+
+  self.classification.placement = parsed
+  if parsed == "chat" then
+    return self:to_chat()
+  end
+
+  return self:submit(prompts)
+end
+
+---Ask the LLM where the inline output should be placed
+---@param prompts table
+---@return nil
+function Inline:classify(prompts)
+  self:capture_streaming_state()
+  self.adapter.opts.stream = true
+
+  local placement = ""
+  local payload = self:build_classification_payload(prompts)
+
+  self.current_request = client
+    .new({ adapter = self.adapter:map_schema_to_params(), user_args = { event = "InlineClassify" } })
+    :request(payload, {
+      callback = function(err, data)
+        if err then
+          return log:error("[Inline] Error during classification: %s", err.message or err)
+        end
+
+        local result = parse_chat_output(self.adapter, data)
+        local text = result and result.output and result.output.content
+        if type(text) == "string" then
+          placement = placement .. text
+        end
+      end,
+      done = function()
+        return self:finish_classification(placement, prompts)
+      end,
+    }, {
+      bufnr = self.buffer_context.bufnr,
+      interaction = "inline",
+      strategy = "inline",
+    })
+end
+
 ---Prompt the LLM
 ---@param user_prompt? string The prompt supplied by the user
 ---@return nil
@@ -289,23 +459,6 @@ function Inline:prompt(user_prompt)
       opts = opts or { visible = true },
     })
   end
-
-  -- Add system prompt first
-  table.insert(prompts, {
-    role = config.constants.SYSTEM_ROLE,
-    content = fmt(
-      CONSTANTS.SYSTEM_PROMPT,
-      self.buffer_context.filetype,
-      (self.classification.placement and CONSTANTS.RESPONSE_WITHOUT_PLACEMENT or CONSTANTS.RESPONSE_WITH_PLACEMENT),
-      config.opts.language
-    ),
-    _meta = {
-      tag = "system_tag",
-    },
-    opts = {
-      visible = false,
-    },
-  })
 
   -- Followed by prompts from external sources
   local ext_prompts = self:make_ext_prompts()
@@ -344,13 +497,11 @@ function Inline:prompt(user_prompt)
 
         log:info("[Inline] User input received: %s", input)
         add_prompt("<prompt>" .. input .. "</prompt>", user_role)
-        self.prompts = prompts
-        return self:submit(vim.deepcopy(prompts))
+        return self:dispatch_prompts(vim.deepcopy(prompts))
       end)
     end)
   else
-    self.prompts = prompts
-    return self:submit(vim.deepcopy(prompts))
+    return self:dispatch_prompts(vim.deepcopy(prompts))
   end
 end
 
@@ -410,50 +561,151 @@ function Inline:stop()
     self.current_request.cancel()
     self.current_request = nil
     adapters.call_handler(self.adapter, "on_exit")
+    self:refresh_diff({ status = "final" })
+    self:reset()
   end
 end
 
-local _streaming = true
+---Build prompts for streaming code generation
+---@param prompts table
+---@return table
+function Inline:build_code_generation_prompts(prompts)
+  local output = {
+    {
+      role = config.constants.SYSTEM_ROLE,
+      content = CONSTANTS.CODE_ONLY_PROMPT,
+      opts = { tag = "system_tag", visible = false },
+    },
+  }
+
+  for i = #self.chat_context, 1, -1 do
+    local message = self.chat_context[i]
+    if message.role == config.constants.LLM_ROLE or message.role == config.constants.USER_ROLE then
+      table.insert(output, {
+        role = message.role,
+        content = message.content,
+        opts = { tag = "chat_context", visible = false },
+      })
+    end
+  end
+
+  vim.list_extend(output, prompts)
+  return output
+end
+
+---Capture the buffer before streaming edits are applied
+---@param placement string
+---@return nil
+function Inline:capture_original_content(placement)
+  if placement == "new" then
+    self.original_content = nil
+    return
+  end
+
+  local ok, content = pcall(get_buffer_lines, self.buffer_context.bufnr)
+  if ok then
+    self.original_content = content
+  else
+    log:error("[Inline] Unable to capture original buffer content for diff: %s", content)
+    self.original_content = nil
+  end
+end
+
+---Start live diff rendering when the current buffer should show streamed changes
+---@param placement string
+---@return nil
+function Inline:start_live_diff(placement)
+  if not config.display.diff.enabled or placement == "new" or not self.original_content then
+    return
+  end
+
+  self:start_diff({
+    original_content = self.original_content,
+    new_content = get_buffer_lines(self.classification.pos.bufnr),
+    placement = placement,
+    live = true,
+  })
+end
+
+---Handle a streamed code-generation chunk
+---@param data table|string
+---@param opts { request_id: number, placement: string, bufnr: number }
+---@return nil
+function Inline:handle_stream_chunk(data, opts)
+  local result = parse_chat_output(self.adapter, data)
+  if result and result.output and result.output.reasoning and result.output.reasoning.content then
+    utils.fire("ReasoningUpdated", { id = opts.request_id, reasoning = result.output.reasoning.content })
+  end
+
+  local text = result and result.output and result.output.content
+  if type(text) ~= "string" or text == "" then
+    return
+  end
+
+  vim.schedule(function()
+    pcall(vim.cmd.undojoin)
+    self:add_buf_message(text)
+    if opts.placement == "new" and api.nvim_get_current_buf() == opts.bufnr then
+      self:buf_scroll_to_end(opts.bufnr)
+    end
+  end)
+end
+
+---Finish a streaming inline request
+---@param placement string
+---@return nil
+function Inline:finish_stream(placement)
+  self.current_request = nil
+  self:refresh_diff({ status = "final" })
+  self:reset()
+  utils.fire("InlineFinished", { placement = placement })
+end
 
 ---Submit the prompts to the LLM to process
 ---@param prompt table The prompts to send to the LLM
 ---@return nil
 function Inline:submit(prompt)
-  -- Inline editing only works with streaming off - We should remember the current status
-  _streaming = self.adapter.opts.stream
-  self.adapter.opts.stream = false
+  local placement = self.classification.placement
+  if not placement or placement == "" then
+    return log:error("[Inline] No placement determined before submission")
+  end
 
-  self:set_keymaps(self.buffer_context.bufnr, { keymaps = { "stop" } })
+  self.prompts = prompt or self.prompts
+  self:capture_streaming_state()
+  self.adapter.opts.stream = true
+  self:capture_original_content(placement)
+  self:place(placement)
+  self:start_live_diff(placement)
+
+  local bufnr = self.classification.pos.bufnr
+  self:set_keymaps(bufnr, { keymaps = { "stop" } })
+
+  local request_id = math.random(10000000)
+  local code_generation_prompts = self:build_code_generation_prompts(self.prompts)
+  local stream_opts = { request_id = request_id, placement = placement, bufnr = bufnr }
 
   self.current_request = client
     .new({ adapter = self.adapter:map_schema_to_params(), user_args = { event = "InlineStarted" } })
-    :request({ messages = self.adapter:map_roles(prompt) }, {
+    :request({ messages = self.adapter:map_roles(code_generation_prompts), tools = {} }, {
       ---@param err string
       ---@param data table
-      ---@param adapter CodeCompanion.HTTPAdapter The modified adapter from the http client
-      callback = function(err, data, adapter)
-        local function error(msg)
-          log:error("[Inline] Request failed with error %s", msg)
-        end
-
+      callback = function(err, data)
         if err then
           local msg = type(err) == "table" and err.message or err
-          return error(msg)
+          return log:error("[Inline] Request failed with error %s", msg)
         end
 
-        if data then
-          data = adapters.call_handler(adapter, "parse_inline", data, self.buffer_context)
-          if data and data.status == CONSTANTS.STATUS_SUCCESS then
-            return self:done(data.output)
-          elseif data then
-            return error(data.output)
-          end
-        end
+        return self:handle_stream_chunk(data, stream_opts)
+      end,
+      done = function()
+        return self:finish_stream(placement)
       end,
     }, {
-      bufnr = self.bufnr,
+      bufnr = bufnr,
       buffer_context = self.buffer_context or {},
       interaction = "inline",
+      strategy = "inline",
+      id = request_id,
     })
 end
 
@@ -522,7 +774,7 @@ end
 ---Reset the inline prompt class
 ---@return nil
 function Inline:reset()
-  self.adapter.opts.stream = _streaming
+  self:restore_streaming_state()
   self.current_request = nil
   api.nvim_clear_autocmds({ group = self.aug })
 end
@@ -649,6 +901,62 @@ function Inline:output(output)
   api.nvim_buf_set_lines(bufnr, line + 1, line + 1, false, vim.list_slice(lines, 2))
 end
 
+---Write streamed text to the buffer and keep the insertion point updated
+---@param content string
+---@return nil
+function Inline:add_buf_message(content)
+  local line = self.classification.pos.line - 1
+  local col = self.classification.pos.col
+  local bufnr = self.classification.pos.bufnr
+  local index = 1
+
+  while index <= #content do
+    local newline = content:find("\n", index) or (#content + 1)
+    local substring = content:sub(index, newline - 1)
+
+    if #substring > 0 then
+      api.nvim_buf_set_text(bufnr, line, col, line, col, { substring })
+      col = col + #substring
+    end
+
+    if newline <= #content then
+      api.nvim_buf_set_lines(bufnr, line + 1, line + 1, false, { "" })
+      line = line + 1
+      col = 0
+    end
+
+    index = newline + 1
+  end
+
+  self.classification.pos.line = line + 1
+  self.classification.pos.col = col
+  self:refresh_diff({ status = "streaming" })
+end
+
+---Scroll every window displaying a buffer to the end
+---@param bufnr number
+---@return nil
+function Inline:buf_scroll_to_end(bufnr)
+  local line_count = api.nvim_buf_line_count(bufnr)
+  for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
+    pcall(api.nvim_win_set_cursor, win, { line_count, 0 })
+  end
+end
+
+---Refresh an active live diff
+---@param opts? table
+---@return nil
+function Inline:refresh_diff(opts)
+  if not self.diff_ui or type(self.diff_ui.refresh) ~= "function" then
+    return
+  end
+
+  local ok, err = pcall(self.diff_ui.refresh, self.diff_ui, opts or {})
+  if not ok then
+    log:error("[Inline] Failed to refresh diff: %s", err)
+  end
+end
+
 ---With the placement determined, we can now place the output from the inline prompt
 ---@param placement string
 ---@return CodeCompanion.Inline
@@ -751,8 +1059,7 @@ function Inline:to_chat()
     end
   end
 
-  -- Turn streaming back on
-  self.adapter.opts.stream = _streaming
+  self:restore_streaming_state()
 
   local chat_opts = {
     adapter = self.adapter,
@@ -783,7 +1090,7 @@ function Inline:build_diff_banner()
 end
 
 ---Start the diff process
----@param args { original_content: string[], new_content: string[], placement: string, code: string }
+---@param args { original_content: string[], new_content: string[], placement: string, code?: string, live?: boolean }
 ---@return nil
 function Inline:start_diff(args)
   log:debug("[Inline] Starting diff")
@@ -792,10 +1099,13 @@ function Inline:start_diff(args)
 
   -- If the buffer has been added to the auto approval list, skip the diff
   if approvals:is_approved(self.bufnr, { tool_name = "inline" }) then
-    self:place(args.placement)
-    pcall(vim.cmd.undojoin)
-    self:output(args.code)
-    return self:reset()
+    if args.code then
+      self:place(args.placement)
+      pcall(vim.cmd.undojoin)
+      self:output(args.code)
+      return self:reset()
+    end
+    return
   end
 
   -- Store original content for potential restoration on reject
@@ -811,6 +1121,7 @@ function Inline:start_diff(args)
     ft = self.buffer_context.filetype,
     inline = true,
     banner = self:build_diff_banner(),
+    live = args.live,
     keymaps = {
       on_accept = function()
         self:on_diff_accepted()
